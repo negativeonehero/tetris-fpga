@@ -1,4 +1,5 @@
-This is an implementation of the game Tetris, following the [2009 design guideline](https://ia800405.us.archive.org/12/items/2009-tetris-variant-concepts_202201/2009%20Tetris%20Design%20Guideline.pdf).
+This is an implementation of the game Tetris, following the [2009 design guideline](https://ia800405.us.archive.org/12/items/2009-tetris-variant-concepts_202201/2009%20Tetris%20Design%20Guideline.pdf).<br>
+Note that the PLL component is missing, it is hardware-specific.
 
 This implementation uses these components from other repositories:
 - 512_8_bold font from [alexfru/512_8](https://github.com/alexfru/512_8).
