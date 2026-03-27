@@ -186,7 +186,10 @@ module tetris_engine (
     input  wire        rst_n,
     input  wire        tick_10khz,
 
+    input  wire        btn_reset_game,
     input  wire        btn_start,
+    input  wire [4:0]  start_level,
+
     input  wire        btn_left,
     input  wire        btn_right,
     input  wire        btn_rotate_cw,
@@ -215,7 +218,10 @@ module tetris_engine (
     output reg  [4:0]  current_level,
     output reg  [31:0] score,
     output reg  [15:0] total_lines,
-    output wire        game_over
+
+    output wire        game_over,
+    output wire        game_ready,
+    output wire        game_active
 );
 
     // ------------------------------------------------------------
@@ -342,26 +348,35 @@ module tetris_engine (
     // ------------------------------------------------------------
     // FSM
     // ------------------------------------------------------------
-    localparam STATE_INIT        = 5'd0,
-               STATE_GENERATE    = 5'd1,
-               STATE_SPAWN       = 5'd2,
-               STATE_SPAWN_WAIT  = 5'd3,
-               STATE_FALLING     = 5'd4,
-               STATE_EVAL_WAIT   = 5'd5,
-               STATE_SRS         = 5'd6,
-               STATE_SRS_WAIT    = 5'd7,
-               STATE_HDROP_WAIT  = 5'd8,
-               STATE_GHOST_START = 5'd9,
-               STATE_GHOST_WAIT  = 5'd10,
-               STATE_LOCK_MINOS  = 5'd11,
-               STATE_PATTERN     = 5'd12,
-               STATE_ELIMINATE   = 5'd13,
-               STATE_SHIFT_ROWS  = 5'd14,
-               STATE_COMPLETION  = 5'd15,
-               STATE_GAME_OVER   = 5'd16;
+    localparam STATE_INIT       = 4'd0,
+               STATE_READY      = 4'd1,
+               STATE_GENERATE   = 4'd2,
+               STATE_FALLING    = 4'd3,
+               STATE_SRS        = 4'd4,
+               STATE_CC         = 4'd5,
+               STATE_LOCK_MINOS = 4'd6,
+               STATE_ELIMINATE  = 4'd7,
+               STATE_SHIFT_ROWS = 4'd8,
+               STATE_GAME_OVER  = 4'd9;
 
-    reg [4:0] current_state;
-    assign game_over = (current_state == STATE_GAME_OVER);
+    reg [3:0] current_state;
+
+    assign game_over   = (current_state == STATE_GAME_OVER);
+    assign game_ready  = (current_state == STATE_READY);
+    assign game_active = (current_state != STATE_INIT) &&
+                         (current_state != STATE_READY) &&
+                         (current_state != STATE_GAME_OVER);
+
+    // ------------------------------------------------------------
+    // Collision-check operation mode
+    // ------------------------------------------------------------
+    localparam CCM_SPAWN = 3'd0,
+               CCM_EVAL  = 3'd1,
+               CCM_SRS   = 3'd2,
+               CCM_HDROP = 3'd3,
+               CCM_GHOST = 3'd4;
+
+    reg [2:0] cc_mode;
 
     // ------------------------------------------------------------
     // Piece shape handling
@@ -524,12 +539,14 @@ module tetris_engine (
     wire current_row_full = &board[clear_r];
     wire [5:0] harddrop_land_y = (test_y <= 7'sd0) ? 6'd0 : (test_y - 7'sd1);
 
+    integer rr;
+
     // ------------------------------------------------------------
     // Main FSM
     // ------------------------------------------------------------
     always @(posedge clk_25MHz or negedge rst_n) begin
         if (!rst_n) begin
-            current_state <= STATE_GAME_OVER;
+            current_state <= STATE_INIT;
 
             next_piece_req <= 1'b0;
             hold_piece     <= 3'd0;
@@ -560,6 +577,7 @@ module tetris_engine (
 
             target_rot       <= 2'd0;
             srs_test_index   <= 3'd0;
+            cc_mode          <= CCM_SPAWN;
 
             last_move_was_spin <= 1'b0;
             last_srs_point     <= 3'd0;
@@ -582,242 +600,345 @@ module tetris_engine (
             check_step     <= 1'b0;
             is_gravity_move<= 1'b0;
             cc_start       <= 1'b0;
+
+            for (rr = 0; rr < 40; rr = rr + 1)
+                board[rr] <= 10'b0;
         end else begin
             next_piece_req <= 1'b0;
             cc_start       <= 1'b0;
 
-            case (current_state)
+            // ----------------------------------------------------
+            // Global game-reset button -> clear to READY via INIT
+            // ----------------------------------------------------
+            if (btn_reset_game) begin
+                hold_piece     <= 3'd0;
+                hold_valid     <= 1'b0;
 
-                // ----------------------------------------------------
-                // Full-speed worker states
-                // ----------------------------------------------------
-                STATE_SPAWN_WAIT: begin
-                    if (cc_done) begin
-                        if (!check_step) begin
-                            if (cc_collision) begin
-                                ghost_y <= 6'd63;
-                                current_state <= STATE_GAME_OVER;
-                            end else begin
-                                test_y     <= test_y + 7'sd1;
-                                check_step <= 1'b1;
-                                cc_start   <= 1'b1;
-                            end
-                        end else begin
-                            last_move_was_spin      <= 1'b0;
-                            pending_soft_drop_score <= 1'b0;
-                            fall_timer              <= 14'd0;
-                            lock_timer              <= 13'd0;
-                            lock_moves              <= 4'd0;
-                            is_touching_floor       <= cc_collision;
-                            lowest_reached_y        <= piece_y;
+                piece_x        <= 5'sd4;
+                piece_y        <= 6'd19;
+                piece_type     <= 3'd0;
+                piece_rot      <= 2'd0;
+                piece_shape    <= 16'h0000;
+                ghost_y        <= 6'd63;
 
-                            ghost_y      <= piece_y;
-                            ghost_scan_y <= piece_y_s + 7'd1;
-                            ghost_dirty  <= 1'b0;
-                            current_state <= STATE_GHOST_START;
-                        end
-                    end
-                end
+                current_level  <= start_level;
+                score          <= 32'd0;
+                total_lines    <= 16'd0;
 
-                STATE_EVAL_WAIT: begin
-                    if (cc_done) begin
-                        if (!check_step) begin
-                            if (!cc_collision) begin
-                                piece_x            <= test_x[4:0];
-                                last_move_was_spin <= 1'b0;
-                                ghost_dirty        <= 1'b1;
-                            end else begin
-                                ghost_dirty        <= 1'b0;
-                            end
+                fall_timer       <= 14'd0;
+                lock_timer       <= 13'd0;
+                lock_moves       <= 4'd0;
+                lowest_reached_y <= 6'd0;
+                can_hold         <= 1'b1;
+                is_touching_floor<= 1'b0;
+                das_timer        <= 12'd0;
+                das_active       <= 1'b0;
 
-                            test_x     <= (!cc_collision) ? test_x : piece_x_s;
-                            test_y     <= piece_y_s + 7'sd1;
-                            test_shape <= piece_shape;
-                            check_step <= 1'b1;
-                            cc_start   <= 1'b1;
-                        end else begin
-                            is_touching_floor <= cc_collision;
+                gravity_r        <= gravity_lut(start_level);
+                soft_gravity_r   <= soft_gravity_lut(start_level);
 
-                            if (is_gravity_move) begin
-                                if (!cc_collision) begin
-                                    piece_y <= test_y[5:0];
+                target_rot       <= 2'd0;
+                srs_test_index   <= 3'd0;
+                cc_mode          <= CCM_SPAWN;
 
-                                    if (pending_soft_drop_score)
-                                        score <= score + 32'd1;
+                last_move_was_spin <= 1'b0;
+                last_srs_point     <= 3'd0;
+                b2b_active         <= 1'b0;
+                next_level_threshold <= 16'd10;
 
-                                    if (test_y[5:0] > lowest_reached_y) begin
-                                        lowest_reached_y <= test_y[5:0];
-                                        lock_moves <= 4'd0;
+                clear_r          <= 6'd39;
+                shift_r          <= 6'd0;
+                lock_idx         <= 5'd0;
+                lines_cleared_comb <= 3'd0;
+                pending_soft_drop_score <= 1'b0;
+                harddrop_origin_y <= 6'd0;
+
+                ghost_scan_y <= 7'd0;
+                ghost_dirty  <= 1'b0;
+
+                test_x         <= 6'sd0;
+                test_y         <= 7'sd0;
+                test_shape     <= 16'd0;
+                check_step     <= 1'b0;
+                is_gravity_move<= 1'b0;
+
+                current_state <= STATE_INIT;
+            end else begin
+                case (current_state)
+
+                    // ------------------------------------------------
+                    // Full-speed worker: generic collision-wait state
+                    // ------------------------------------------------
+                    STATE_CC: begin
+                        if (cc_done) begin
+                            case (cc_mode)
+
+                                // ------------------------------------
+                                // Spawn collision + initial floor check
+                                // ------------------------------------
+                                CCM_SPAWN: begin
+                                    if (!check_step) begin
+                                        if (cc_collision) begin
+                                            ghost_y <= 6'd63;
+                                            current_state <= STATE_GAME_OVER;
+                                        end else begin
+                                            test_y     <= test_y + 7'sd1;
+                                            check_step <= 1'b1;
+                                            cc_start   <= 1'b1;
+                                            current_state <= STATE_CC;
+                                        end
+                                    end else begin
+                                        last_move_was_spin      <= 1'b0;
+                                        pending_soft_drop_score <= 1'b0;
+                                        fall_timer              <= 14'd0;
+                                        lock_timer              <= 13'd0;
+                                        lock_moves              <= 4'd0;
+                                        is_touching_floor       <= cc_collision;
+                                        lowest_reached_y        <= piece_y;
+
+                                        ghost_y      <= piece_y;
+                                        ghost_scan_y <= piece_y_s + 7'd1;
+                                        ghost_dirty  <= 1'b0;
+
+                                        test_x       <= piece_x_s;
+                                        test_y       <= piece_y_s + 7'd1;
+                                        test_shape   <= piece_shape;
+                                        cc_mode      <= CCM_GHOST;
+                                        cc_start     <= 1'b1;
+                                        current_state <= STATE_CC;
                                     end
-
-                                    ghost_y      <= test_y[5:0];
-                                    ghost_scan_y <= test_y + 7'd1;
-                                    ghost_dirty  <= 1'b0;
-                                end else begin
-                                    ghost_dirty  <= 1'b0;
                                 end
 
-                                pending_soft_drop_score <= 1'b0;
-                                lock_timer <= 13'd0;
+                                // ------------------------------------
+                                // Move / gravity evaluation
+                                // ------------------------------------
+                                CCM_EVAL: begin
+                                    if (!check_step) begin
+                                        if (!cc_collision) begin
+                                            piece_x            <= test_x[4:0];
+                                            last_move_was_spin <= 1'b0;
+                                            ghost_dirty        <= 1'b1;
+                                        end else begin
+                                            ghost_dirty        <= 1'b0;
+                                        end
 
-                                current_state <= (!cc_collision) ? STATE_GHOST_START : STATE_FALLING;
+                                        test_x     <= (!cc_collision) ? test_x : piece_x_s;
+                                        test_y     <= piece_y_s + 7'sd1;
+                                        test_shape <= piece_shape;
+                                        check_step <= 1'b1;
+                                        cc_start   <= 1'b1;
+                                        current_state <= STATE_CC;
+                                    end else begin
+                                        is_touching_floor       <= cc_collision;
+                                        pending_soft_drop_score <= 1'b0;
+
+                                        if (is_gravity_move) begin
+                                            if (!cc_collision) begin
+                                                piece_y <= test_y[5:0];
+
+                                                if (pending_soft_drop_score)
+                                                    score <= score + 32'd1;
+
+                                                if (test_y[5:0] > lowest_reached_y) begin
+                                                    lowest_reached_y <= test_y[5:0];
+                                                    lock_moves <= 4'd0;
+                                                end
+
+                                                ghost_y      <= test_y[5:0];
+                                                ghost_scan_y <= test_y + 7'd1;
+                                                ghost_dirty  <= 1'b0;
+
+                                                test_x       <= piece_x_s;
+                                                test_y       <= test_y + 7'd1;
+                                                test_shape   <= piece_shape;
+                                                cc_mode      <= CCM_GHOST;
+                                                cc_start     <= 1'b1;
+                                                lock_timer   <= 13'd0;
+                                                current_state <= STATE_CC;
+                                            end else begin
+                                                ghost_dirty  <= 1'b0;
+                                                current_state <= STATE_FALLING;
+                                            end
+                                        end else begin
+                                            if (cc_collision && lock_moves < 4'd15) begin
+                                                lock_timer <= 13'd0;
+                                                lock_moves <= lock_moves + 4'd1;
+                                            end
+
+                                            if (ghost_dirty) begin
+                                                ghost_y      <= piece_y;
+                                                ghost_scan_y <= piece_y_s + 7'd1;
+                                                ghost_dirty  <= 1'b0;
+
+                                                test_x       <= (!cc_collision) ? test_x : piece_x_s;
+                                                test_y       <= piece_y_s + 7'd1;
+                                                test_shape   <= piece_shape;
+                                                cc_mode      <= CCM_GHOST;
+                                                cc_start     <= 1'b1;
+                                                current_state <= STATE_CC;
+                                            end else begin
+                                                current_state <= STATE_FALLING;
+                                            end
+                                        end
+                                    end
+                                end
+
+                                // ------------------------------------
+                                // Rotation check result
+                                // ------------------------------------
+                                CCM_SRS: begin
+                                    if (!cc_collision) begin
+                                        piece_x <= test_x[4:0];
+                                        piece_y <= test_y[5:0];
+                                        piece_rot <= target_rot;
+                                        piece_shape <= next_rotation_shape;
+                                        last_srs_point <= srs_test_index;
+                                        last_move_was_spin <= 1'b1;
+                                        is_gravity_move <= 1'b0;
+                                        pending_soft_drop_score <= 1'b0;
+                                        ghost_dirty <= 1'b1;
+
+                                        test_y     <= test_y + 7'd1;
+                                        test_shape <= next_rotation_shape;
+                                        check_step <= 1'b1;
+                                        cc_mode    <= CCM_EVAL;
+                                        cc_start   <= 1'b1;
+                                        current_state <= STATE_CC;
+                                    end else begin
+                                        if (srs_test_index < 3'd4) begin
+                                            srs_test_index <= srs_test_index + 3'd1;
+                                            current_state  <= STATE_SRS;
+                                        end else begin
+                                            current_state  <= STATE_FALLING;
+                                        end
+                                    end
+                                end
+
+                                // ------------------------------------
+                                // Hard-drop scan
+                                // ------------------------------------
+                                CCM_HDROP: begin
+                                    if (cc_collision) begin
+                                        piece_y <= harddrop_land_y;
+                                        ghost_y <= harddrop_land_y;
+                                        score   <= score + ((harddrop_land_y - harddrop_origin_y) << 1);
+                                        lock_timer <= LOCK_DELAY_TICKS;
+                                        is_touching_floor <= 1'b1;
+                                        last_move_was_spin <= 1'b0;
+                                        pending_soft_drop_score <= 1'b0;
+                                        ghost_dirty <= 1'b0;
+                                        current_state <= STATE_FALLING;
+                                    end else begin
+                                        test_y   <= test_y + 7'd1;
+                                        cc_start <= 1'b1;
+                                        current_state <= STATE_CC;
+                                    end
+                                end
+
+                                // ------------------------------------
+                                // Ghost scan
+                                // ------------------------------------
+                                CCM_GHOST: begin
+                                    if (cc_collision) begin
+                                        ghost_y <= ghost_scan_y[5:0] - 6'd1;
+                                        ghost_dirty <= 1'b0;
+                                        current_state <= STATE_FALLING;
+                                    end else begin
+                                        ghost_scan_y <= ghost_scan_y + 7'd1;
+                                        test_y       <= ghost_scan_y + 7'd1;
+                                        cc_start     <= 1'b1;
+                                        current_state <= STATE_CC;
+                                    end
+                                end
+
+                                default: begin
+                                    current_state <= STATE_GAME_OVER;
+                                end
+                            endcase
+                        end
+                    end
+
+                    // ------------------------------------------------
+                    // Full-speed worker: SRS test launch
+                    // ------------------------------------------------
+                    STATE_SRS: begin
+                        test_x     <= piece_x_s + srs_offset_x;
+                        test_y     <= piece_y_s + srs_offset_y;
+                        test_shape <= next_rotation_shape;
+                        cc_mode    <= CCM_SRS;
+                        cc_start   <= 1'b1;
+                        current_state <= STATE_CC;
+                    end
+
+                    // ------------------------------------------------
+                    // Full-speed worker: lock current piece into board
+                    // ------------------------------------------------
+                    STATE_LOCK_MINOS: begin
+                        if (lock_idx > 5'd15) begin
+                            lines_cleared_comb <= 3'd0;
+                            clear_r            <= 6'd39;
+                            current_state      <= STATE_ELIMINATE;
+                        end else begin
+                            if (piece_shape[15 - lock_idx]) begin
+                                board[piece_y + lock_idx[3:2]][piece_x + lock_idx[1:0]] <= 1'b1;
+                            end
+                            lock_idx <= lock_idx + 5'd1;
+                        end
+                    end
+
+                    // ------------------------------------------------
+                    // Full-speed worker: scan for full rows
+                    // ------------------------------------------------
+                    STATE_ELIMINATE: begin
+                        if (current_row_full) begin
+                            lines_cleared_comb <= lines_cleared_comb + 3'd1;
+                            shift_r            <= clear_r;
+                            current_state      <= STATE_SHIFT_ROWS;
+                        end else begin
+                            if (clear_r == 6'd0) begin
+                                can_hold <= 1'b1;
+                                pending_soft_drop_score <= 1'b0;
+                                ghost_y <= 6'd63;
+                                ghost_dirty <= 1'b0;
+
+                                score       <= score + final_score_add;
+                                total_lines <= total_lines + lines_cleared_comb;
+
+                                if (lines_cleared_comb > 0)
+                                    b2b_active <= is_difficult;
+
+                                if ((total_lines + lines_cleared_comb) >= next_level_threshold) begin
+                                    current_level <= current_level + 5'd1;
+                                    next_level_threshold <= next_level_threshold + 16'd10;
+                                    gravity_r      <= gravity_lut(current_level + 5'd1);
+                                    soft_gravity_r <= soft_gravity_lut(current_level + 5'd1);
+                                end
+
+                                current_state <= STATE_GENERATE;
                             end else begin
-                                pending_soft_drop_score <= 1'b0;
-
-                                if (cc_collision && lock_moves < 4'd15) begin
-                                    lock_timer <= 13'd0;
-                                    lock_moves <= lock_moves + 4'd1;
-                                end
-
-                                if (ghost_dirty) begin
-                                    ghost_y      <= piece_y;
-                                    ghost_scan_y <= piece_y_s + 7'd1;
-                                    ghost_dirty  <= 1'b0;
-                                    current_state <= STATE_GHOST_START;
-                                end else begin
-                                    current_state <= STATE_FALLING;
-                                end
+                                clear_r <= clear_r - 6'd1;
                             end
                         end
                     end
-                end
 
-                STATE_SRS_WAIT: begin
-                    if (cc_done) begin
-                        if (!cc_collision) begin
-                            piece_x <= test_x[4:0];
-                            piece_y <= test_y[5:0];
-                            piece_rot <= target_rot;
-                            piece_shape <= next_rotation_shape;
-                            last_srs_point <= srs_test_index;
-                            last_move_was_spin <= 1'b1;
-                            is_gravity_move <= 1'b0;
-                            pending_soft_drop_score <= 1'b0;
-                            ghost_dirty <= 1'b1;
-
-                            test_y     <= test_y + 7'd1;
-                            test_shape <= next_rotation_shape;
-                            check_step <= 1'b1;
-                            cc_start   <= 1'b1;
-                            current_state <= STATE_EVAL_WAIT;
+                    // ------------------------------------------------
+                    // Full-speed worker: shift rows down
+                    // ------------------------------------------------
+                    STATE_SHIFT_ROWS: begin
+                        if (shift_r > 6'd0) begin
+                            board[shift_r] <= board[shift_r - 6'd1];
+                            shift_r <= shift_r - 6'd1;
                         end else begin
-                            if (srs_test_index < 3'd4) begin
-                                srs_test_index <= srs_test_index + 3'd1;
-                                current_state  <= STATE_SRS;
-                            end else begin
-                                current_state  <= STATE_FALLING;
-                            end
+                            board[0] <= 10'b0;
+                            current_state <= STATE_ELIMINATE;
                         end
                     end
-                end
 
-                STATE_HDROP_WAIT: begin
-                    if (cc_done) begin
-                        if (cc_collision) begin
-                            piece_y <= harddrop_land_y;
-                            ghost_y <= harddrop_land_y;
-                            score   <= score + ((harddrop_land_y - harddrop_origin_y) << 1);
-                            lock_timer <= LOCK_DELAY_TICKS;
-                            is_touching_floor <= 1'b1;
-                            last_move_was_spin <= 1'b0;
-                            pending_soft_drop_score <= 1'b0;
-                            ghost_dirty <= 1'b0;
-                            current_state <= STATE_FALLING;
-                        end else begin
-                            test_y   <= test_y + 7'd1;
-                            cc_start <= 1'b1;
-                        end
-                    end
-                end
-
-                STATE_GHOST_START: begin
-                    test_x     <= piece_x_s;
-                    test_y     <= ghost_scan_y;
-                    test_shape <= piece_shape;
-                    cc_start   <= 1'b1;
-                    current_state <= STATE_GHOST_WAIT;
-                end
-
-                STATE_GHOST_WAIT: begin
-                    if (cc_done) begin
-                        if (cc_collision) begin
-                            ghost_y <= ghost_scan_y[5:0] - 6'd1;
-                            ghost_dirty <= 1'b0;
-                            current_state <= STATE_FALLING;
-                        end else begin
-                            ghost_scan_y <= ghost_scan_y + 7'd1;
-                            current_state <= STATE_GHOST_START;
-                        end
-                    end
-                end
-
-                STATE_LOCK_MINOS: begin
-                    if (lock_idx > 5'd15) begin
-                        current_state <= STATE_PATTERN;
-                    end else begin
-                        if (piece_shape[15 - lock_idx]) begin
-                            board[piece_y + lock_idx[3:2]][piece_x + lock_idx[1:0]] <= 1'b1;
-                        end
-                        lock_idx <= lock_idx + 5'd1;
-                    end
-                end
-
-                STATE_ELIMINATE: begin
-                    if (current_row_full) begin
-                        lines_cleared_comb <= lines_cleared_comb + 3'd1;
-                        shift_r            <= clear_r;
-                        current_state      <= STATE_SHIFT_ROWS;
-                    end else begin
-                        if (clear_r == 6'd0)
-                            current_state <= STATE_COMPLETION;
-                        else
-                            clear_r <= clear_r - 6'd1;
-                    end
-                end
-
-                STATE_SHIFT_ROWS: begin
-                    if (shift_r > 6'd0) begin
-                        board[shift_r] <= board[shift_r - 6'd1];
-                        shift_r <= shift_r - 6'd1;
-                    end else begin
-                        board[0] <= 10'b0;
-                        current_state <= STATE_ELIMINATE;
-                    end
-                end
-
-                STATE_COMPLETION: begin
-                    can_hold <= 1'b1;
-                    pending_soft_drop_score <= 1'b0;
-                    ghost_y <= 6'd63;
-                    ghost_dirty <= 1'b0;
-
-                    score       <= score + final_score_add;
-                    total_lines <= total_lines + lines_cleared_comb;
-
-                    if (lines_cleared_comb > 0)
-                        b2b_active <= is_difficult;
-
-                    if ((total_lines + lines_cleared_comb) >= next_level_threshold) begin
-                        current_level <= current_level + 5'd1;
-                        next_level_threshold <= next_level_threshold + 16'd10;
-                        gravity_r      <= gravity_lut(current_level + 5'd1);
-                        soft_gravity_r <= soft_gravity_lut(current_level + 5'd1);
-                    end
-
-                    current_state <= STATE_GENERATE;
-                end
-
-                // ----------------------------------------------------
-                // Tick-gated gameplay states
-                // ----------------------------------------------------
-                default: begin
-                    if (tick_10khz) begin
-                        if (btn_start) begin
-                            clear_r <= 6'd39;
-                            ghost_y <= 6'd63;
-                            ghost_dirty <= 1'b0;
-                            current_state <= STATE_INIT;
-                        end else begin
+                    // ------------------------------------------------
+                    // Tick-gated gameplay / setup states
+                    // ------------------------------------------------
+                    default: begin
+                        if (tick_10khz) begin
                             case (current_state)
 
                                 STATE_INIT: begin
@@ -832,19 +953,53 @@ module tetris_engine (
 
                                         score <= 32'd0;
                                         total_lines <= 16'd0;
-                                        current_level <= 5'd1;
+                                        current_level <= start_level;
                                         next_level_threshold <= 16'd10;
-                                        gravity_r      <= gravity_lut(5'd1);
-                                        soft_gravity_r <= soft_gravity_lut(5'd1);
+                                        gravity_r      <= gravity_lut(start_level);
+                                        soft_gravity_r <= soft_gravity_lut(start_level);
 
                                         hold_valid <= 1'b0;
                                         hold_piece <= 3'd0;
                                         piece_type <= 3'd0;
                                         piece_rot  <= 2'd0;
                                         piece_shape<= 16'h0000;
+                                        piece_x    <= 5'sd4;
+                                        piece_y    <= 6'd19;
 
                                         can_hold <= 1'b1;
                                         b2b_active <= 1'b0;
+                                        current_state <= STATE_READY;
+                                    end
+                                end
+
+                                STATE_READY: begin
+                                    ghost_y <= 6'd63;
+                                    ghost_dirty <= 1'b0;
+
+                                    piece_type  <= 3'd0;
+                                    piece_rot   <= 2'd0;
+                                    piece_shape <= 16'h0000;
+                                    piece_x     <= 5'sd4;
+                                    piece_y     <= 6'd19;
+
+                                    current_level  <= start_level;
+                                    gravity_r      <= gravity_lut(start_level);
+                                    soft_gravity_r <= soft_gravity_lut(start_level);
+                                    next_level_threshold <= 16'd10;
+
+                                    fall_timer       <= 14'd0;
+                                    lock_timer       <= 13'd0;
+                                    lock_moves       <= 4'd0;
+                                    lowest_reached_y <= 6'd0;
+                                    can_hold         <= 1'b1;
+                                    is_touching_floor<= 1'b0;
+                                    das_timer        <= 12'd0;
+                                    das_active       <= 1'b0;
+                                    pending_soft_drop_score <= 1'b0;
+                                    last_move_was_spin <= 1'b0;
+                                    last_srs_point     <= 3'd0;
+
+                                    if (btn_start) begin
                                         current_state <= STATE_GENERATE;
                                     end
                                 end
@@ -862,17 +1017,15 @@ module tetris_engine (
 
                                         pending_soft_drop_score <= 1'b0;
                                         next_piece_req <= 1'b1;
-                                        current_state <= STATE_SPAWN;
-                                    end
-                                end
 
-                                STATE_SPAWN: begin
-                                    test_x     <= piece_x_s;
-                                    test_y     <= piece_y_s;
-                                    test_shape <= piece_shape;
-                                    check_step <= 1'b0;
-                                    cc_start   <= 1'b1;
-                                    current_state <= STATE_SPAWN_WAIT;
+                                        test_x     <= 6'sd4;
+                                        test_y     <= 7'sd19;
+                                        test_shape <= shape_lut(next_piece_from_bag, 2'd0);
+                                        check_step <= 1'b0;
+                                        cc_mode    <= CCM_SPAWN;
+                                        cc_start   <= 1'b1;
+                                        current_state <= STATE_CC;
+                                    end
                                 end
 
                                 STATE_FALLING: begin
@@ -888,8 +1041,9 @@ module tetris_engine (
                                         test_x     <= piece_x_s;
                                         test_y     <= piece_y_s + 7'sd1;
                                         test_shape <= piece_shape;
+                                        cc_mode    <= CCM_HDROP;
                                         cc_start   <= 1'b1;
-                                        current_state <= STATE_HDROP_WAIT;
+                                        current_state <= STATE_CC;
                                     end
                                     else if (btn_hold && can_hold) begin
                                         pending_soft_drop_score <= 1'b0;
@@ -905,7 +1059,14 @@ module tetris_engine (
                                             piece_shape <= shape_lut(hold_piece, 2'd0);
                                             piece_x     <= 5'sd4;
                                             piece_y     <= 6'd19;
-                                            current_state <= STATE_SPAWN;
+
+                                            test_x     <= 6'sd4;
+                                            test_y     <= 7'sd19;
+                                            test_shape <= shape_lut(hold_piece, 2'd0);
+                                            check_step <= 1'b0;
+                                            cc_mode    <= CCM_SPAWN;
+                                            cc_start   <= 1'b1;
+                                            current_state <= STATE_CC;
                                         end else begin
                                             hold_piece <= piece_type;
                                             hold_valid <= 1'b1;
@@ -926,8 +1087,9 @@ module tetris_engine (
                                         test_shape <= piece_shape;
                                         check_step <= 1'b0;
                                         is_gravity_move <= 1'b0;
+                                        cc_mode    <= CCM_EVAL;
                                         cc_start   <= 1'b1;
-                                        current_state <= STATE_EVAL_WAIT;
+                                        current_state <= STATE_CC;
                                         das_timer  <= 12'd0;
                                         das_active <= 1'b1;
                                     end
@@ -938,8 +1100,9 @@ module tetris_engine (
                                         test_shape <= piece_shape;
                                         check_step <= 1'b0;
                                         is_gravity_move <= 1'b0;
+                                        cc_mode    <= CCM_EVAL;
                                         cc_start   <= 1'b1;
-                                        current_state <= STATE_EVAL_WAIT;
+                                        current_state <= STATE_CC;
                                         das_timer  <= 12'd0;
                                         das_active <= 1'b1;
                                     end
@@ -959,8 +1122,9 @@ module tetris_engine (
                                             test_shape <= piece_shape;
                                             check_step <= 1'b1;
                                             is_gravity_move <= 1'b1;
+                                            cc_mode    <= CCM_EVAL;
                                             cc_start   <= 1'b1;
-                                            current_state <= STATE_EVAL_WAIT;
+                                            current_state <= STATE_CC;
                                         end
                                         else if (!btn_soft_drop && fall_timer >= gravity_r) begin
                                             fall_timer <= 14'd0;
@@ -970,8 +1134,9 @@ module tetris_engine (
                                             test_shape <= piece_shape;
                                             check_step <= 1'b1;
                                             is_gravity_move <= 1'b1;
+                                            cc_mode    <= CCM_EVAL;
                                             cc_start   <= 1'b1;
-                                            current_state <= STATE_EVAL_WAIT;
+                                            current_state <= STATE_CC;
                                         end
                                         else if (is_touching_floor) begin
                                             if (lock_timer >= LOCK_DELAY_TICKS || lock_moves >= 4'd15) begin
@@ -989,20 +1154,6 @@ module tetris_engine (
                                     end
                                 end
 
-                                STATE_SRS: begin
-                                    test_x     <= piece_x_s + srs_offset_x;
-                                    test_y     <= piece_y_s + srs_offset_y;
-                                    test_shape <= next_rotation_shape;
-                                    cc_start   <= 1'b1;
-                                    current_state <= STATE_SRS_WAIT;
-                                end
-
-                                STATE_PATTERN: begin
-                                    lines_cleared_comb <= 3'd0;
-                                    clear_r <= 6'd39;
-                                    current_state <= STATE_ELIMINATE;
-                                end
-
                                 STATE_GAME_OVER: begin
                                     ghost_y <= 6'd63;
                                     ghost_dirty <= 1'b0;
@@ -1015,8 +1166,8 @@ module tetris_engine (
                             endcase
                         end
                     end
-                end
-            endcase
+                endcase
+            end
         end
     end
 endmodule
